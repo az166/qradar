@@ -3,7 +3,6 @@ import numpy as np
 import os
 import json
 import time
-#from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from math import exp
 from utils.indicators import (
@@ -22,7 +21,6 @@ _kline_cache = {}
 async def fetch_klines_cached(client, symbol, interval, limit, ttl_seconds):
     """
     Mengambil data kline dengan sistem penyimpanan sementara (cache).
-    Mencegah panggilan API berulang untuk data historis yang jarang berubah.
     """
     key = f"{symbol}_{interval}_{limit}"
     now = time.time()
@@ -39,7 +37,7 @@ async def fetch_klines_cached(client, symbol, interval, limit, ttl_seconds):
 
 
 # ==============================================================================
-# 1. PERFORMANCE LOGGER & BACKTESTING ENGINE (Thread-Safe with Lock)
+# 1. PERFORMANCE LOGGER & BACKTESTING ENGINE (Thread-Safe File I/O)
 # ==============================================================================
 class TradingPerformanceLogger:
     def __init__(self, log_filepath="logs/signal_performance.json"):
@@ -52,17 +50,18 @@ class TradingPerformanceLogger:
 
     def _write_entry_to_file(self, log_entry):
         try:
-            with open(self.log_filepath, 'r+') as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError:
-                    data = []
-                data.append(log_entry)
-                f.seek(0)
-                f.truncate()
+            data = []
+            if os.path.exists(self.log_filepath):
+                with open(self.log_filepath, 'r') as f:
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError:
+                        data = []
+            data.append(log_entry)
+            with open(self.log_filepath, 'w') as f:
                 json.dump(data, f, indent=4)
         except Exception as e:
-            print(f"Error logging entry signal: {e}")
+            print(f"[LOGGER ERROR] Gagal mencatat entry signal: {e}")
 
     async def log_entry_signal_async(self, symbol, entry_price, score, action, z_score, btc_risk_status, tp_level, cl_level):
         async with self.lock:  
@@ -87,27 +86,30 @@ class TradingPerformanceLogger:
 
     def _write_close_to_file(self, symbol, exit_price, exit_time):
         try:
-            with open(self.log_filepath, 'r+') as f:
+            if not os.path.exists(self.log_filepath):
+                return
+            with open(self.log_filepath, 'r') as f:
                 try:
                     data = json.load(f)
                 except json.JSONDecodeError:
                     data = []
-                updated = False
-                for entry in data:
-                    if entry["symbol"] == symbol and entry["status"] == "OPEN":
-                        entry["status"] = "CLOSED"
-                        entry["exit_price"] = exit_price
-                        entry["timestamp_exit"] = exit_time
-                        pnl = ((exit_price - entry["entry_price"]) / entry["entry_price"]) * 100
-                        entry["pnl_pct"] = round(pnl, 2)
-                        updated = True
-                        break
-                if updated:
-                    f.seek(0)
-                    f.truncate()
+            
+            updated = False
+            for entry in data:
+                if entry["symbol"] == symbol and entry["status"] == "OPEN":
+                    entry["status"] = "CLOSED"
+                    entry["exit_price"] = exit_price
+                    entry["timestamp_exit"] = exit_time
+                    pnl = ((exit_price - entry["entry_price"]) / entry["entry_price"]) * 100
+                    entry["pnl_pct"] = round(pnl, 2)
+                    updated = True
+                    break
+
+            if updated:
+                with open(self.log_filepath, 'w') as f:
                     json.dump(data, f, indent=4)
         except Exception as e:
-            print(f"Error closing logged signal for {symbol}: {e}")
+            print(f"[LOGGER ERROR] Gagal menutup posisi {symbol}: {e}")
 
     async def close_logged_signal_async(self, symbol, exit_price, current_time=None):
         async with self.lock:
@@ -118,8 +120,29 @@ perf_logger = TradingPerformanceLogger()
 
 
 # ==============================================================================
-# 2. QUANTITATIVE & PREDICTIVE FUNCTIONS (Advanced Predictive Engine v4)
+# 2. QUANTITATIVE & PREDICTIVE FUNCTIONS
 # ==============================================================================
+def calculate_rsi_efficient(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    
+    closes_arr = np.array(closes, dtype=float)
+    deltas = np.diff(closes_arr)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(float(100.0 - (100.0 / (1.0 + rs))), 2)
+
 def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang, vol_spike_ratio, is_squeeze, is_confirmed_breakout, is_15m_volume_burst, btc_correlation, btc_risk_level, pure_vol_24h=20000000):
     if not klines_1w or len(klines_1w) < 3 or not klines_1d or len(klines_1d) < 99 or not klines_1h or len(klines_1h) < 10 or not klines_15m or len(klines_15m) < 4:
         return "NEUTRAL", 50.0, 0.0, 0.0
@@ -242,7 +265,6 @@ def detect_fair_value_gap(klines_1h):
 
     return False, 0.0
 
-
 def calculate_volume_metrics(klines_1h, window=20):
     if len(klines_1h) < window + 1:
         return 0.0, 50.0, 1.0
@@ -284,7 +306,6 @@ def analyze_market_structure(klines_1h, window=5):
     swing_high_indices = np.where(is_swing_high & valid_range)[0]
     swing_low_indices = np.where(is_swing_low & valid_range)[0]
 
-    # Perbaikan tipe data luaran agar seragam float saat data swing kosong
     if len(swing_high_indices) < 2 or len(swing_low_indices) < 2:
         return "CONSOLIDATION", float(np.max(highs[-10:])), float(np.min(lows[-10:]))
 
@@ -328,7 +349,7 @@ def calculate_atr_and_spread(klines_1d, klines_1h):
         prev_close = float(klines_1d[i-1][4])
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         true_ranges.append(tr)
-    
+
     atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
     current_spread = float(klines_1h[-1][2]) - float(klines_1h[-1][3])
     recent_spreads = [float(k[2]) - float(k[3]) for k in klines_1h[-6:-1]]
@@ -387,26 +408,62 @@ def calculate_confidence_score(market_struct, breakout_status, z_score, percenti
     action = "STRONG BUY" if score >= 75 else "SPECULATIVE BUY / EARLY TREND" if score >= 55 else "HOLDING / MONITOR" if score >= 40 else "WAIT & SEE"
     return score, action
 
-def hitung_matriks_atr_dinamis(live_price, entry_price, atr, vol_spike_ratio, whale_dominance, btc_risk_level, highest_peak=0.0):
+def hitung_matriks_atr_dinamis(
+    live_price: float,
+    entry_price: float,
+    atr: float,
+    vol_spike_ratio: float,
+    whale_dominance: float,
+    btc_risk_level: float,
+    rsi_saat_ini: float = 50.0,
+    highest_peak: float = 0.0,
+    proyeksi_atas: float = 0.0
+):
     try:
-        base_multiplier = 1.2 if btc_risk_level == 4 else 1.5 if btc_risk_level == 3 else 2.0 if btc_risk_level == 2 else 2.5
-        vol_modifier = 1.3 if vol_spike_ratio > 2.0 else 1.15 if vol_spike_ratio > 1.5 else 1.0
-        whale_modifier = 0.9 if whale_dominance > 65.0 else 1.0
-        
-        final_multiplier = base_multiplier * vol_modifier * whale_modifier
-        atr_distance = atr * final_multiplier
-        reference_price = max(entry_price, highest_peak) if highest_peak > 0.0 else entry_price
+        base_entry = entry_price if entry_price > 0 else live_price
 
-        dynamic_tp = reference_price + (atr_distance * 1.5)
-        dynamic_cl = reference_price - atr_distance
+        if atr <= 0 or live_price <= 0:
+            return round(base_entry * 1.02, 6), round(base_entry * 0.985, 6)
 
-        if dynamic_cl < 0:
-            dynamic_cl = entry_price * 0.95 
+        is_strong_bullish = (rsi_saat_ini >= 65.0) and (vol_spike_ratio >= 2.0)
+        is_bearish_momentum = (rsi_saat_ini <= 40.0) or (vol_spike_ratio < 0.7)
 
-        return round(dynamic_tp, 6), round(dynamic_cl, 6)
+        if is_strong_bullish:
+            calculated_tp = base_entry + (atr * 3.5)
+            if proyeksi_atas > base_entry:
+                realistic_target = proyeksi_atas * 0.98
+                calculated_tp = min(calculated_tp, realistic_target)
+        elif is_bearish_momentum:
+            calculated_tp = base_entry + (atr * 1.2)
+        else:
+            tp_atr = base_entry + (atr * 2.0)
+            if proyeksi_atas > base_entry:
+                calculated_tp = min(tp_atr, proyeksi_atas * 0.95)
+            else:
+                calculated_tp = tp_atr
+
+        if highest_peak > base_entry:
+            trailing_tp = highest_peak - (atr * 1.0)
+            calculated_tp = max(calculated_tp, trailing_tp)
+
+        risk_factor = max(1.0, float(btc_risk_level))
+
+        if is_bearish_momentum or risk_factor > 1.5:
+            cl_multiplier = 0.8 * risk_factor
+        elif is_strong_bullish:
+            cl_multiplier = 2.0
+        else:
+            cl_multiplier = 1.5 * risk_factor
+
+        calculated_cl = base_entry - (atr * cl_multiplier)
+        calculated_cl = min(calculated_cl, live_price * 0.995)
+
+        return round(calculated_tp, 6), round(calculated_cl, 6)
+
     except Exception as e:
         print(f"[ENGINE RECOVERY CRITICAL] Fallback ATR terpicu akibat: {e}")
-        return round(entry_price * 1.05, 6), round(entry_price * 0.97, 6)
+        base_p = entry_price if entry_price > 0 else live_price
+        return round(base_p * 1.05, 6), round(base_p * 0.97, 6)
 
 
 # ==============================================================================
@@ -421,7 +478,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             fetch_klines_cached(client, symbol, '15m', 10, ttl_seconds=60),
             fetch_order_book_imbalance(client, symbol)
         )
-        
+
         if not klines_1w or not klines_1d or not klines_1h or not klines_15m or len(klines_1h) < 40 or len(klines_1d) < 99: 
             return None
 
@@ -432,7 +489,6 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             live_price = state_manager.get_live_price(symbol, float(klines_1h[-1][4]))
             btc_returns_snapshot = state_manager.get_btc_returns()
 
-            # Optimal Impor Nilai Skalar untuk Perhitungan
             open_price = float(klines_1h[-1][1])
             high_price = float(klines_1h[-1][2])
             low_price = float(klines_1h[-1][3])
@@ -448,20 +504,23 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             macd_line, signal_line, macd_hist, hist_list = await asyncio.to_thread(calculate_macd_efficient, hourly_closes)
             is_ma_trend_bullish = live_price > ma25_daily and live_price > ma99_daily
 
+            rsi_1h = calculate_rsi_efficient(hourly_closes, period=14)
+
             vol_z_score, vol_percentile, vol_spike_ratio = calculate_volume_metrics(klines_1h, window=20)
             volatility_based_threshold = max(0.2, min(1.5, (atr / live_price) * 100 * 0.15)) if live_price > 0 else 0.4
 
             v_15m_curr = float(klines_15m[-1][7])
-            v_15m_ma = sum(float(k[7]) for k in klines_15m[-5:-1]) / 4
+            v_15m_ma = sum(float(k[7]) for k in klines_15m[-5:-1]) / 4 if len(klines_15m) >= 5 else 1.0
             is_15m_volume_burst = v_15m_curr > (v_15m_ma * 2.5) if v_15m_ma > 0 else False
 
             coin_returns = []
-            for i in range(-24, 0):
+            slice_start = max(-len(klines_1h), -24)
+            for i in range(slice_start, 0):
                 try:
                     c_open = float(klines_1h[i][1])
                     if c_open > 0: 
                         coin_returns.append((float(klines_1h[i][4]) - c_open) / c_open)
-                except:
+                except IndexError:
                     pass
 
             btc_correlation = await asyncio.to_thread(calculate_pearson_correlation, coin_returns, btc_returns_snapshot)
@@ -522,7 +581,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             if btc_risk["level"] == 4 and coin_name not in user_portfolio:
                 fase = f"ENGINE LOCKED ({state_manager.btc_status.get('reason','CRASH')})"
             else:
-                if status_rencana_otomatis in ["STRONG_BUY", "STRONG BUY"]:
+                if status_rencana_otomatis == "STRONG BUY":
                     fase = "INSTITUTIONAL BUY" if is_ma_trend_bullish and order_book_ratio > 1.2 else "VALID BREAKOUT"
                 elif is_squeeze and (vol_velocity > 1.8 or is_15m_volume_burst) and price_pct_1h > volatility_based_threshold:
                     fase = "⚡ SQUEEZE BREAKOUT (EARLY TREND)"
@@ -532,7 +591,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                     fase = "🔄 MOMENTUM REVERSAL (BOTTOMING)"
 
             if state_manager.is_alert_state_differs(coin_name, fase):
-                if status_rencana_otomatis in ["STRONG_BUY", "STRONG BUY"] or fase in ["VALID BREAKOUT", "INSTITUTIONAL BUY", "⚡ SQUEEZE BREAKOUT (EARLY TREND)"]:
+                if status_rencana_otomatis == "STRONG BUY" or fase in ["VALID BREAKOUT", "INSTITUTIONAL BUY", "⚡ SQUEEZE BREAKOUT (EARLY TREND)"]:
                     if btc_risk["allowed_trade"] or is_uncorrelated_or_decoupled:
                         emoji = "👑 BRAND NEW MSS BREAKOUT!" if fase == "INSTITUTIONAL BUY" else "🔥 BREAKOUT SPIKE"
                         fvg_info = f"\n⚠️ Fair Value Gap Spotted: Yes (Retest Area: ${fvg_target_price:.4f})" if has_fvg else ""
@@ -560,11 +619,18 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             current_peak = state_manager.update_trailing_peak(device_id, coin_name, entry_price, live_price) if entry_price > 0 and amount > 0 else 0.0
 
             dynamic_tp, dynamic_cl = hitung_matriks_atr_dinamis(
-                live_price=live_price, entry_price=entry_price, atr=atr, vol_spike_ratio=vol_spike_ratio,
-                whale_dominance=whale_dominance, btc_risk_level=btc_risk["level"], highest_peak=current_peak
+                live_price=live_price,
+                entry_price=entry_price,
+                atr=atr,
+                vol_spike_ratio=vol_spike_ratio,
+                whale_dominance=whale_dominance,
+                btc_risk_level=btc_risk["level"],
+                rsi_saat_ini=rsi_1h,
+                highest_peak=current_peak,
+                proyeksi_atas=proyeksi_atas
             )
 
-            if status_rencana_otomatis in ["STRONG_BUY", "STRONG BUY"] and entry_price == 0:
+            if status_rencana_otomatis == "STRONG BUY" and entry_price == 0:
                 await perf_logger.log_entry_signal_async(
                     symbol=symbol, entry_price=live_price, score=momentum_score, 
                     action=status_rencana_otomatis, z_score=vol_z_score, 
@@ -574,9 +640,9 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             max_allowed_atr = live_price * 0.15
             smoothed_atr = max(0.000001, min(atr, max_allowed_atr) if atr > 0 else (live_price * 0.02))
 
-            if status_rencana_otomatis in ["STRONG_BUY", "STRONG BUY"] and has_fvg:
+            if status_rencana_otomatis == "STRONG BUY" and has_fvg:
                 saran_entry = fvg_target_price
-            elif status_rencana_otomatis in ["STRONG_BUY", "STRONG BUY"] and is_confirmed_breakout:
+            elif status_rencana_otomatis == "STRONG BUY" and is_confirmed_breakout:
                 saran_entry = last_sh + (0.15 * smoothed_atr)
             else:
                 saran_entry = live_price - (0.5 * smoothed_atr)
@@ -606,7 +672,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 "status_aksi": status_rencana_otomatis, "saran_entry": saran_entry,
                 "pnl_val": pnl_val, "pnl_pct": pnl_pct, "current_value": current_value,
                 "vol_velocity_pct": f"{round(vol_velocity * 100, 1)}%", "z_score": round(vol_z_score, 2),
-                
+                "rsi": rsi_1h,
                 "tren_pendek": prediksi_tren.upper(),
                 "tren_panjang": tren_panjang_skenario.upper(),
                 "probabilitas_prediksi": f"{probabilitas_prediksi}%",
@@ -614,5 +680,5 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 "proyeksi_bawah": round(proyeksi_bawah, 8) if live_price < 1.0 else round(proyeksi_bawah, 4)
             }
         except Exception as e:
-            print(f"Error processing {symbol}: {e}")
+            print(f"[PIPELINE ERROR] Gagal memproses {symbol}: {e}")
             return None

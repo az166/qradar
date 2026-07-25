@@ -19,9 +19,6 @@ from services.telegram_service import send_telegram_in_worker_thread
 _kline_cache = {}
 
 async def fetch_klines_cached(client, symbol, interval, limit, ttl_seconds):
-    """
-    Mengambil data kline dengan sistem penyimpanan sementara (cache).
-    """
     key = f"{symbol}_{interval}_{limit}"
     now = time.time()
 
@@ -37,7 +34,7 @@ async def fetch_klines_cached(client, symbol, interval, limit, ttl_seconds):
 
 
 # ==============================================================================
-# 1. PERFORMANCE LOGGER & BACKTESTING ENGINE (Thread-Safe File I/O)
+# 1. PERFORMANCE LOGGER & BACKTESTING ENGINE
 # ==============================================================================
 class TradingPerformanceLogger:
     def __init__(self, log_filepath="logs/signal_performance.json"):
@@ -93,7 +90,7 @@ class TradingPerformanceLogger:
                     data = json.load(f)
                 except json.JSONDecodeError:
                     data = []
-            
+
             updated = False
             for entry in data:
                 if entry["symbol"] == symbol and entry["status"] == "OPEN":
@@ -125,7 +122,7 @@ perf_logger = TradingPerformanceLogger()
 def calculate_rsi_efficient(closes, period=14):
     if len(closes) < period + 1:
         return 50.0
-    
+
     closes_arr = np.array(closes, dtype=float)
     deltas = np.diff(closes_arr)
     gains = np.where(deltas > 0, deltas, 0.0)
@@ -142,6 +139,52 @@ def calculate_rsi_efficient(closes, period=14):
         return 100.0
     rs = avg_gain / avg_loss
     return round(float(100.0 - (100.0 / (1.0 + rs))), 2)
+
+def detect_bottoming_pattern(klines_1h, klines_15m, rsi_1h, is_bullish_div):
+    if len(klines_1h) < 15 or len(klines_15m) < 4:
+        return False, "NONE"
+
+    closes_1h = np.array([float(k[4]) for k in klines_1h])
+    lows_1h = np.array([float(k[3]) for k in klines_1h])
+    vols_1h = np.array([float(k[7]) for k in klines_1h])
+    
+    closes_15m = np.array([float(k[4]) for k in klines_15m])
+    lows_15m = np.array([float(k[3]) for k in klines_15m])
+
+    is_oversold = rsi_1h <= 35.0
+    
+    min_idx_1 = np.argmin(lows_1h[-15:-5])
+    min_idx_2 = np.argmin(lows_1h[-5:])
+    val_1 = lows_1h[-15:-5][min_idx_1]
+    val_2 = lows_1h[-5:][min_idx_2]
+    
+    is_double_bottom = abs(val_1 - val_2) / val_1 <= 0.008 and closes_1h[-1] > val_2
+
+    last_candle_open = float(klines_1h[-1][1])
+    last_candle_close = float(klines_1h[-1][4])
+    last_candle_high = float(klines_1h[-1][2])
+    last_candle_low = float(klines_1h[-1][3])
+    
+    candle_range = max(0.0001, last_candle_high - last_candle_low)
+    lower_wick = min(last_candle_open, last_candle_close) - last_candle_low
+    wick_ratio = lower_wick / candle_range
+    
+    avg_vol = np.mean(vols_1h[-10:-1]) if len(vols_1h) >= 10 else 1.0
+    is_vol_spike = vols_1h[-1] > (avg_vol * 1.8)
+    is_absorption = wick_ratio >= 0.45 and is_vol_spike
+
+    is_15m_higher_low = lows_15m[-1] > lows_15m[-2] and closes_15m[-1] > closes_15m[-2]
+
+    if is_bullish_div and (is_double_bottom or is_absorption):
+        return True, "CONFIRMED_BOTTOMING"
+    elif is_oversold and is_absorption:
+        return True, "VOLUME_ABSORPTION_BOTTOM"
+    elif is_oversold and is_double_bottom and is_15m_higher_low:
+        return True, "DOUBLE_BOTTOM_ACCUMULATION"
+    elif is_bullish_div and is_15m_higher_low:
+        return True, "EARLY_BULLISH_DIVERGENCE"
+
+    return False, "NONE"
 
 def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang, vol_spike_ratio, is_squeeze, is_confirmed_breakout, is_15m_volume_burst, btc_correlation, btc_risk_level, pure_vol_24h=20000000):
     if not klines_1w or len(klines_1w) < 3 or not klines_1d or len(klines_1d) < 99 or not klines_1h or len(klines_1h) < 10 or not klines_15m or len(klines_15m) < 4:
@@ -232,6 +275,10 @@ def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang
 
     probabilitas_sukses = max(10.0, min(95.0, probabilitas_sukses))
 
+    # Fix: Default multiplier untuk mencegah UnboundLocalError
+    mult_atas_bullish, mult_bawah_bullish = 1.5, 0.75
+    mult_atas_bearish, mult_bawah_bearish = 0.75, 1.5
+
     if is_squeeze:
         mult_atas_bullish, mult_bawah_bullish = 1.1, 0.5
         mult_atas_bearish, mult_bawah_bearish = 0.5, 1.1
@@ -240,9 +287,6 @@ def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang
         boost_factor = min(1.5, max(1.0, vol_cap_ratio))
         mult_atas_bullish, mult_bawah_bullish = 2.5 * boost_factor, 1.2
         mult_atas_bearish, mult_bawah_bearish = 0.8, 1.8 * boost_factor
-    else:
-        mult_atas_bullish, mult_bawah_bullish = 1.5, 0.75
-        mult_atas_bearish, mult_bawah_bearish = 0.75, 1.5
 
     if "BULLISH" in prediksi_tren or "UP" in prediksi_tren:
         proyeksi_atas = live_price + (atr_sekarang * mult_atas_bullish)
@@ -372,7 +416,7 @@ def calculate_btc_risk_level(btc_status_dict, btc_returns_24h):
         return {"level": 2, "status": "MEDIUM RISK", "allocation_pct": 50.0, "allowed_trade": True}
     return {"level": 1, "status": "LOW RISK", "allocation_pct": 100.0, "allowed_trade": True}
 
-def calculate_confidence_score(market_struct, breakout_status, z_score, percentile, ob_ratio, ma_bullish, btc_risk):
+def calculate_confidence_score(market_struct, breakout_status, z_score, percentile, ob_ratio, ma_bullish, btc_risk, is_bottoming=False, bottoming_type="NONE"):
     if btc_risk["level"] == 4:
         return 0, "WAIT & SEE"
 
@@ -396,6 +440,14 @@ def calculate_confidence_score(market_struct, breakout_status, z_score, percenti
         score += 15
     elif breakout_status == "PENDING_BREAKOUT":
         score += 7
+
+    if is_bottoming:
+        if bottoming_type == "CONFIRMED_BOTTOMING":
+            score += 25
+        elif bottoming_type in ["VOLUME_ABSORPTION_BOTTOM", "DOUBLE_BOTTOM_ACCUMULATION"]:
+            score += 18
+        elif bottoming_type == "EARLY_BULLISH_DIVERGENCE":
+            score += 12
 
     if btc_risk["level"] == 1:
         score += 10
@@ -513,29 +565,34 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             v_15m_ma = sum(float(k[7]) for k in klines_15m[-5:-1]) / 4 if len(klines_15m) >= 5 else 1.0
             is_15m_volume_burst = v_15m_curr > (v_15m_ma * 2.5) if v_15m_ma > 0 else False
 
+            # Fix: Ekstraksi return kline dengan aman tanpa IndexError
             coin_returns = []
-            slice_start = max(-len(klines_1h), -24)
-            for i in range(slice_start, 0):
-                try:
-                    c_open = float(klines_1h[i][1])
-                    if c_open > 0: 
-                        coin_returns.append((float(klines_1h[i][4]) - c_open) / c_open)
-                except IndexError:
-                    pass
+            recent_klines = klines_1h[-25:]
+            for kline in recent_klines[:-1]:
+                c_open = float(kline[1])
+                c_close = float(kline[4])
+                if c_open > 0:
+                    coin_returns.append((c_close - c_open) / c_open)
 
             btc_correlation = await asyncio.to_thread(calculate_pearson_correlation, coin_returns, btc_returns_snapshot)
             is_uncorrelated_or_decoupled = btc_correlation < 0.20
 
             has_fvg, fvg_target_price = detect_fair_value_gap(klines_1h)
             prev_volume = float(klines_1h[-2][7]) if len(klines_1h) >= 2 else 1.0
-            vol_velocity = (float(klines_1h[-1][7]) - prev_volume) / prev_volume if prev_volume > 0 else 0.0
+            vol_velocity = (float(klines_1h[-1][7]) - prev_volume) / max(0.000001, prev_volume)
 
             ma20_hourly, bb_upper, bb_lower, kc_upper, kc_lower, is_squeeze = calculate_technical_envelope_single_pass(
                 prices=hourly_closes, atr=atr, period=20, num_std_dev=2.0, num_atr_mult=1.5
             )
 
             is_bullish_div = detect_bullish_divergence(hourly_closes, hist_list, period=10) if len(hourly_closes) >= 10 and max(hourly_closes[-10:]) != min(hourly_closes[-10:]) else False
-            market_struct, last_sh, last_sl = await asyncio.to_thread(analyze_market_structure, klines_1h, 5)
+            
+            is_bottoming, bottoming_type = detect_bottoming_pattern(
+                klines_1h=klines_1h, klines_15m=klines_15m, rsi_1h=rsi_1h, is_bullish_div=is_bullish_div
+            )
+
+            # Execution eksekusi sync langsung untuk fungsi ringan
+            market_struct, last_sh, last_sl = analyze_market_structure(klines_1h, 5)
 
             breakout_status = verify_breakout_status(
                 live_price=live_price, last_close=last_close_1h, open_price=open_price,
@@ -574,7 +631,8 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
 
             momentum_score, status_rencana_otomatis = calculate_confidence_score(
                 market_struct=market_struct, breakout_status=breakout_status, z_score=vol_z_score,
-                percentile=vol_percentile, ob_ratio=order_book_ratio, ma_bullish=is_ma_trend_bullish, btc_risk=btc_risk
+                percentile=vol_percentile, ob_ratio=order_book_ratio, ma_bullish=is_ma_trend_bullish, btc_risk=btc_risk,
+                is_bottoming=is_bottoming, bottoming_type=bottoming_type
             )
 
             fase = "CONSOLIDATION"
@@ -583,6 +641,8 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             else:
                 if status_rencana_otomatis == "STRONG BUY":
                     fase = "INSTITUTIONAL BUY" if is_ma_trend_bullish and order_book_ratio > 1.2 else "VALID BREAKOUT"
+                elif is_bottoming and bottoming_type in ["CONFIRMED_BOTTOMING", "VOLUME_ABSORPTION_BOTTOM"]:
+                    fase = f"🛡️ BOTTOMING CONFIRMED ({bottoming_type})"
                 elif is_squeeze and (vol_velocity > 1.8 or is_15m_volume_burst) and price_pct_1h > volatility_based_threshold:
                     fase = "⚡ SQUEEZE BREAKOUT (EARLY TREND)"
                 elif abs(price_pct_1h) < volatility_based_threshold and vol_velocity > 2.5 and vol_z_score < 0.5:
@@ -591,11 +651,12 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                     fase = "🔄 MOMENTUM REVERSAL (BOTTOMING)"
 
             if state_manager.is_alert_state_differs(coin_name, fase):
-                if status_rencana_otomatis == "STRONG BUY" or fase in ["VALID BREAKOUT", "INSTITUTIONAL BUY", "⚡ SQUEEZE BREAKOUT (EARLY TREND)"]:
+                if status_rencana_otomatis == "STRONG BUY" or fase in ["VALID BREAKOUT", "INSTITUTIONAL BUY", "⚡ SQUEEZE BREAKOUT (EARLY TREND)"] or "BOTTOMING" in fase:
                     if btc_risk["allowed_trade"] or is_uncorrelated_or_decoupled:
-                        emoji = "👑 BRAND NEW MSS BREAKOUT!" if fase == "INSTITUTIONAL BUY" else "🔥 BREAKOUT SPIKE"
+                        emoji = "🛡️ BOTTOMING DETECTED!" if "BOTTOMING" in fase else ("👑 BRAND NEW MSS BREAKOUT!" if fase == "INSTITUTIONAL BUY" else "🔥 BREAKOUT SPIKE")
                         fvg_info = f"\n⚠️ Fair Value Gap Spotted: Yes (Retest Area: ${fvg_target_price:.4f})" if has_fvg else ""
                         decouple_info = f"\n🔄 BTC Correlation: {btc_correlation:.2f} (Decoupled)" if is_uncorrelated_or_decoupled else f"\n🔄 BTC Correlation: {btc_correlation:.2f}"
+                        bottom_info = f"\n🎯 Bottom Type: `{bottoming_type}`" if is_bottoming else ""
 
                         harga_terformat = f"${live_price:.8f}" if live_price < 1.0 else f"${live_price:.4f}"
                         fmt_atas = f"${proyeksi_atas:.8f}" if proyeksi_atas < 1.0 else f"${proyeksi_atas:.4f}"
@@ -605,7 +666,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                             f"{emoji}\n\nCoin: *{coin_name}*\nConfidence Score: `{momentum_score}/100` (`{status_rencana_otomatis}`)\n"
                             f"Vol Z-Score: `{vol_z_score}` (Pct: {vol_percentile}%)\n"
                             f"Structure: `{market_struct}` | Breakout: `{breakout_status}`\n"
-                            f"Whale Dominance: `{whale_dominance}%`{decouple_info}{fvg_info}\n"
+                            f"Whale Dominance: `{whale_dominance}%`{bottom_info}{decouple_info}{fvg_info}\n"
                             f"🔮 *Trend Prediction*: `{prediksi_tren}` ({probabilitas_prediksi}%)\n"
                             f"🎯 *Projected Range*: {fmt_bawah} - {fmt_atas}\n"
                             f"Live Price: *{harga_terformat}*"
@@ -673,6 +734,8 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 "pnl_val": pnl_val, "pnl_pct": pnl_pct, "current_value": current_value,
                 "vol_velocity_pct": f"{round(vol_velocity * 100, 1)}%", "z_score": round(vol_z_score, 2),
                 "rsi": rsi_1h,
+                "is_bottoming": is_bottoming,
+                "bottoming_type": bottoming_type,
                 "tren_pendek": prediksi_tren.upper(),
                 "tren_panjang": tren_panjang_skenario.upper(),
                 "probabilitas_prediksi": f"{probabilitas_prediksi}%",

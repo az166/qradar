@@ -3,6 +3,7 @@ import numpy as np
 import os
 import json
 import time
+import logging
 from datetime import datetime
 from math import exp
 from utils.indicators import (
@@ -14,13 +15,18 @@ from services.binance_service import fetch_klines_safely_async, fetch_order_book
 from services.telegram_service import send_telegram_in_worker_thread
 
 # ==============================================================================
-# DATA CACHE STORE (MULTI-TIER CACHING)
+# DATA CACHE STORE (PERBAIKAN: Periodic Cleanup tanpa threshold len)
 # ==============================================================================
 _kline_cache = {}
 
 async def fetch_klines_cached(client, symbol, interval, limit, ttl_seconds):
     key = f"{symbol}_{interval}_{limit}"
     now = time.time()
+
+    # Hapus cache kadaluarsa secara berkala tanpa menunggu len > 500
+    expired_keys = [k for k, (_, exp_t) in _kline_cache.items() if now > exp_t]
+    for k in expired_keys:
+        _kline_cache.pop(k, None)
 
     if key in _kline_cache:
         cached_data, expire_time = _kline_cache[key]
@@ -34,31 +40,42 @@ async def fetch_klines_cached(client, symbol, interval, limit, ttl_seconds):
 
 
 # ==============================================================================
-# 1. PERFORMANCE LOGGER & BACKTESTING ENGINE
+# 1. PERFORMANCE LOGGER (PERBAIKAN: Thread-safe File Atomic Write)
 # ==============================================================================
 class TradingPerformanceLogger:
     def __init__(self, log_filepath="logs/signal_performance.json"):
         self.log_filepath = log_filepath
         self.lock = asyncio.Lock()  
-        os.makedirs(os.path.dirname(self.log_filepath), exist_ok=True)
+        os.makedirs(os.path.dirname(self.log_filepath) or ".", exist_ok=True)
         if not os.path.exists(self.log_filepath):
             with open(self.log_filepath, 'w') as f:
                 json.dump([], f)
 
-    def _write_entry_to_file(self, log_entry):
+    def _read_data(self):
+        if not os.path.exists(self.log_filepath):
+            return []
         try:
-            data = []
-            if os.path.exists(self.log_filepath):
-                with open(self.log_filepath, 'r') as f:
-                    try:
-                        data = json.load(f)
-                    except json.JSONDecodeError:
-                        data = []
+            with open(self.log_filepath, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
+    def _write_entry_sync(self, log_entry):
+        try:
+            data = self._read_data()
+            has_open = any(e.get("symbol") == log_entry["symbol"] and e.get("status") == "OPEN" for e in data)
+            if has_open:
+                return None
+
             data.append(log_entry)
-            with open(self.log_filepath, 'w') as f:
+            temp_path = f"{self.log_filepath}.tmp"
+            with open(temp_path, 'w') as f:
                 json.dump(data, f, indent=4)
+            os.replace(temp_path, self.log_filepath)
+            return log_entry["signal_id"]
         except Exception as e:
-            print(f"[LOGGER ERROR] Gagal mencatat entry signal: {e}")
+            logging.error(f"[LOGGER ERROR] Gagal mencatat entry signal: {e}")
+            return None
 
     async def log_entry_signal_async(self, symbol, entry_price, score, action, z_score, btc_risk_status, tp_level, cl_level):
         async with self.lock:  
@@ -78,46 +95,43 @@ class TradingPerformanceLogger:
                 "pnl_pct": 0.0,
                 "timestamp_exit": None
             }
-            await asyncio.to_thread(self._write_entry_to_file, log_entry)
-            return log_entry["signal_id"]
+            return await asyncio.to_thread(self._write_entry_sync, log_entry)
 
-    def _write_close_to_file(self, symbol, exit_price, exit_time):
+    def _write_close_sync(self, symbol, exit_price, exit_time):
         try:
-            if not os.path.exists(self.log_filepath):
+            data = self._read_data()
+            if not data:
                 return
-            with open(self.log_filepath, 'r') as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError:
-                    data = []
 
             updated = False
             for entry in data:
-                if entry["symbol"] == symbol and entry["status"] == "OPEN":
+                if entry.get("symbol") == symbol and entry.get("status") == "OPEN":
                     entry["status"] = "CLOSED"
                     entry["exit_price"] = exit_price
                     entry["timestamp_exit"] = exit_time
-                    pnl = ((exit_price - entry["entry_price"]) / entry["entry_price"]) * 100
+                    pnl = ((exit_price - entry["entry_price"]) / entry["entry_price"]) * 100 if entry.get("entry_price", 0) > 0 else 0.0
                     entry["pnl_pct"] = round(pnl, 2)
                     updated = True
                     break
 
             if updated:
-                with open(self.log_filepath, 'w') as f:
+                temp_path = f"{self.log_filepath}.tmp"
+                with open(temp_path, 'w') as f:
                     json.dump(data, f, indent=4)
+                os.replace(temp_path, self.log_filepath)
         except Exception as e:
-            print(f"[LOGGER ERROR] Gagal menutup posisi {symbol}: {e}")
+            logging.error(f"[LOGGER ERROR] Gagal menutup posisi {symbol}: {e}")
 
     async def close_logged_signal_async(self, symbol, exit_price, current_time=None):
         async with self.lock:
             exit_time = current_time if current_time else datetime.now().isoformat()
-            await asyncio.to_thread(self._write_close_to_file, symbol, exit_price, exit_time)
+            await asyncio.to_thread(self._write_close_sync, symbol, exit_price, exit_time)
 
 perf_logger = TradingPerformanceLogger()
 
 
 # ==============================================================================
-# 2. QUANTITATIVE & PREDICTIVE FUNCTIONS
+# 2. QUANTITATIVE & PREDICTIVE FUNCTIONS (FIXED & SAFE)
 # ==============================================================================
 def calculate_rsi_efficient(closes, period=14):
     if len(closes) < period + 1:
@@ -141,34 +155,41 @@ def calculate_rsi_efficient(closes, period=14):
     return round(float(100.0 - (100.0 / (1.0 + rs))), 2)
 
 def detect_bottoming_pattern(klines_1h, klines_15m, rsi_1h, is_bullish_div):
-    if len(klines_1h) < 15 or len(klines_15m) < 4:
+    # Ditingkatkan dari 20 ke 30 untuk memastikan slice aman
+    if len(klines_1h) < 30 or len(klines_15m) < 4:
         return False, "NONE"
 
     closes_1h = np.array([float(k[4]) for k in klines_1h])
     lows_1h = np.array([float(k[3]) for k in klines_1h])
     vols_1h = np.array([float(k[7]) for k in klines_1h])
-    
+
     closes_15m = np.array([float(k[4]) for k in klines_15m])
     lows_15m = np.array([float(k[3]) for k in klines_15m])
 
     is_oversold = rsi_1h <= 35.0
-    
-    min_idx_1 = np.argmin(lows_1h[-15:-5])
-    min_idx_2 = np.argmin(lows_1h[-5:])
-    val_1 = lows_1h[-15:-5][min_idx_1]
-    val_2 = lows_1h[-5:][min_idx_2]
-    
-    is_double_bottom = abs(val_1 - val_2) / val_1 <= 0.008 and closes_1h[-1] > val_2
+
+    # PERBAIKAN INDEX: Menggunakan slice relatif dari 20 candle terakhir
+    sub_lows = lows_1h[-20:]
+    part1 = sub_lows[:10]
+    part2 = sub_lows[10:]
+
+    if len(part1) == 0 or len(part2) == 0:
+        return False, "NONE"
+
+    val_1 = np.min(part1)
+    val_2 = np.min(part2)
+
+    is_double_bottom = abs(val_1 - val_2) / max(1e-8, val_1) <= 0.008 and closes_1h[-1] > val_2
 
     last_candle_open = float(klines_1h[-1][1])
     last_candle_close = float(klines_1h[-1][4])
     last_candle_high = float(klines_1h[-1][2])
     last_candle_low = float(klines_1h[-1][3])
-    
+
     candle_range = max(0.0001, last_candle_high - last_candle_low)
     lower_wick = min(last_candle_open, last_candle_close) - last_candle_low
     wick_ratio = lower_wick / candle_range
-    
+
     avg_vol = np.mean(vols_1h[-10:-1]) if len(vols_1h) >= 10 else 1.0
     is_vol_spike = vols_1h[-1] > (avg_vol * 1.8)
     is_absorption = wick_ratio >= 0.45 and is_vol_spike
@@ -197,7 +218,7 @@ def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang
     closes_15m = [float(k[4]) for k in klines_15m]
 
     live_price = closes_1h[-1]
-    relative_atr = (atr_sekarang / live_price) * 100 if live_price > 0 else 0.0
+    relative_atr = (atr_sekarang / max(1e-8, live_price)) * 100
 
     is_weekly_bullish = closes_1w[-1] >= closes_1w[-2]
 
@@ -225,7 +246,7 @@ def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang
     w_long_sum = sum(w_long)
     vol_ema_panjang = sum(v * w for v, w in zip(v_long, w_long)) / w_long_sum if w_long_sum > 0 else 1.0
 
-    volume_velocity = vol_ema_pendek / vol_ema_panjang if vol_ema_panjang > 0.000001 else 1.0
+    volume_velocity = vol_ema_pendek / max(0.000001, vol_ema_panjang)
 
     prediksi_tren = "SIDEWAYS / REGRESSION"
     probabilitas_sukses = 50.0
@@ -275,7 +296,6 @@ def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang
 
     probabilitas_sukses = max(10.0, min(95.0, probabilitas_sukses))
 
-    # Fix: Default multiplier untuk mencegah UnboundLocalError
     mult_atas_bullish, mult_bawah_bullish = 1.5, 0.75
     mult_atas_bearish, mult_bawah_bearish = 0.75, 1.5
 
@@ -290,10 +310,10 @@ def prediksi_arah_tren(klines_1w, klines_1d, klines_1h, klines_15m, atr_sekarang
 
     if "BULLISH" in prediksi_tren or "UP" in prediksi_tren:
         proyeksi_atas = live_price + (atr_sekarang * mult_atas_bullish)
-        proyeksi_bawah = live_price - (atr_sekarang * mult_bawah_bullish)
+        proyeksi_bawah = max(0.0, live_price - (atr_sekarang * mult_bawah_bullish))
     else:
         proyeksi_atas = live_price + (atr_sekarang * mult_atas_bearish)
-        proyeksi_bawah = live_price - (atr_sekarang * mult_bawah_bearish)
+        proyeksi_bawah = max(0.0, live_price - (atr_sekarang * mult_bawah_bearish))
 
     return prediksi_tren, round(probabilitas_sukses, 1), proyeksi_atas, proyeksi_bawah
 
@@ -312,12 +332,19 @@ def detect_fair_value_gap(klines_1h):
 def calculate_volume_metrics(klines_1h, window=20):
     if len(klines_1h) < window + 1:
         return 0.0, 50.0, 1.0
+
     historical_volumes = [float(k[7]) for k in klines_1h[-(window+1):-1]]
     current_volume = float(klines_1h[-1][7])
+    n_hist = len(historical_volumes)
 
-    mean_vol = sum(historical_volumes) / window
-    variance = sum((x - mean_vol) ** 2 for x in historical_volumes) / window
-    std_vol = variance ** 0.5
+    if n_hist == 0:
+        return 0.0, 50.0, 1.0
+
+    mean_vol = sum(historical_volumes) / n_hist
+    variance = sum((x - mean_vol) ** 2 for x in historical_volumes) / n_hist
+    
+    # PERBAIKAN MATH DOMAIN ERROR: Mencegah akar angka negatif akibat float precision
+    std_vol = max(0.0, variance) ** 0.5
 
     z_score = (current_volume - mean_vol) / std_vol if std_vol > 0.00001 else 0.0
     z_score = max(-3.0, min(6.0, z_score))
@@ -386,6 +413,9 @@ def verify_breakout_status(live_price, last_close, open_price, high_price, low_p
     return "NO_BREAKOUT"
 
 def calculate_atr_and_spread(klines_1d, klines_1h):
+    if not klines_1d or len(klines_1d) < 2 or not klines_1h:
+        return 0.0, 1.0
+
     true_ranges = []
     for i in range(1, len(klines_1d)):
         high = float(klines_1d[i][2])
@@ -404,6 +434,9 @@ def calculate_atr_and_spread(klines_1d, klines_1h):
     return atr, current_spread / avg_recent_spread
 
 def calculate_btc_risk_level(btc_status_dict, btc_returns_24h):
+    if not isinstance(btc_status_dict, dict):
+        btc_status_dict = {}
+
     is_safe = btc_status_dict.get("is_safe", True)
     reason = str(btc_status_dict.get("reason", "")).upper()
     avg_return = sum(btc_returns_24h) / len(btc_returns_24h) if btc_returns_24h else 0.0
@@ -470,50 +503,57 @@ def hitung_matriks_atr_dinamis(
     rsi_saat_ini: float = 50.0,
     highest_peak: float = 0.0,
     proyeksi_atas: float = 0.0
-):
+) -> tuple[float, float]:
     try:
         base_entry = entry_price if entry_price > 0 else live_price
 
         if atr <= 0 or live_price <= 0:
-            return round(base_entry * 1.02, 6), round(base_entry * 0.985, 6)
+            return round(base_entry * 1.03, 6), round(base_entry * 0.98, 6)
 
         is_strong_bullish = (rsi_saat_ini >= 65.0) and (vol_spike_ratio >= 2.0)
         is_bearish_momentum = (rsi_saat_ini <= 40.0) or (vol_spike_ratio < 0.7)
+        risk_level = int(btc_risk_level)
 
-        if is_strong_bullish:
-            calculated_tp = base_entry + (atr * 3.5)
-            if proyeksi_atas > base_entry:
-                realistic_target = proyeksi_atas * 0.98
-                calculated_tp = min(calculated_tp, realistic_target)
-        elif is_bearish_momentum:
-            calculated_tp = base_entry + (atr * 1.2)
-        else:
-            tp_atr = base_entry + (atr * 2.0)
-            if proyeksi_atas > base_entry:
-                calculated_tp = min(tp_atr, proyeksi_atas * 0.95)
-            else:
-                calculated_tp = tp_atr
-
-        if highest_peak > base_entry:
-            trailing_tp = highest_peak - (atr * 1.0)
-            calculated_tp = max(calculated_tp, trailing_tp)
-
-        risk_factor = max(1.0, float(btc_risk_level))
-
-        if is_bearish_momentum or risk_factor > 1.5:
-            cl_multiplier = 0.8 * risk_factor
+        if risk_level >= 3:
+            cl_multiplier = 0.8
         elif is_strong_bullish:
-            cl_multiplier = 2.0
+            cl_multiplier = 1.2
+        elif is_bearish_momentum:
+            cl_multiplier = 1.0
         else:
-            cl_multiplier = 1.5 * risk_factor
+            cl_multiplier = 1.5
 
         calculated_cl = base_entry - (atr * cl_multiplier)
+
+        if highest_peak > base_entry:
+            trailing_stop = highest_peak - (atr * 1.2)
+            calculated_cl = max(calculated_cl, trailing_stop)
+
         calculated_cl = min(calculated_cl, live_price * 0.995)
+
+        if is_strong_bullish:
+            tp_multiplier = 3.5
+        elif is_bearish_momentum or risk_level >= 3:
+            tp_multiplier = 1.5
+        else:
+            tp_multiplier = 2.5
+
+        calculated_tp = base_entry + (atr * tp_multiplier)
+
+        if proyeksi_atas > base_entry:
+            realistic_target = proyeksi_atas * 0.98
+            if realistic_target > base_entry:
+                calculated_tp = min(calculated_tp, realistic_target)
+
+        risk = base_entry - calculated_cl
+        if risk > 0:
+            min_tp = base_entry + (risk * 1.2)
+            calculated_tp = max(calculated_tp, min_tp)
 
         return round(calculated_tp, 6), round(calculated_cl, 6)
 
     except Exception as e:
-        print(f"[ENGINE RECOVERY CRITICAL] Fallback ATR terpicu akibat: {e}")
+        logging.error(f"[ENGINE RECOVERY] Fallback ATR terpicu akibat: {e}")
         base_p = entry_price if entry_price > 0 else live_price
         return round(base_p * 1.05, 6), round(base_p * 0.97, 6)
 
@@ -538,8 +578,8 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             coin_name = symbol.replace("USDT", "")
             w1_close, w2_close = float(klines_1w[-1][4]), float(klines_1w[-2][4])
 
-            live_price = state_manager.get_live_price(symbol, float(klines_1h[-1][4]))
-            btc_returns_snapshot = state_manager.get_btc_returns()
+            live_price = state_manager.get_live_price(symbol, float(klines_1h[-1][4])) if hasattr(state_manager, 'get_live_price') else float(klines_1h[-1][4])
+            btc_returns_snapshot = state_manager.get_btc_returns() if hasattr(state_manager, 'get_btc_returns') else []
 
             open_price = float(klines_1h[-1][1])
             high_price = float(klines_1h[-1][2])
@@ -559,20 +599,19 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             rsi_1h = calculate_rsi_efficient(hourly_closes, period=14)
 
             vol_z_score, vol_percentile, vol_spike_ratio = calculate_volume_metrics(klines_1h, window=20)
-            volatility_based_threshold = max(0.2, min(1.5, (atr / live_price) * 100 * 0.15)) if live_price > 0 else 0.4
+            volatility_based_threshold = max(0.2, min(1.5, (atr / max(1e-8, live_price)) * 100 * 0.15))
 
             v_15m_curr = float(klines_15m[-1][7])
             v_15m_ma = sum(float(k[7]) for k in klines_15m[-5:-1]) / 4 if len(klines_15m) >= 5 else 1.0
             is_15m_volume_burst = v_15m_curr > (v_15m_ma * 2.5) if v_15m_ma > 0 else False
 
-            # Fix: Ekstraksi return kline dengan aman tanpa IndexError
             coin_returns = []
             recent_klines = klines_1h[-25:]
             for kline in recent_klines[:-1]:
                 c_open = float(kline[1])
                 c_close = float(kline[4])
                 if c_open > 0:
-                    coin_returns.append((c_close - c_open) / c_open)
+                    coin_returns.append((c_close - c_open) / max(1e-8, c_open))
 
             btc_correlation = await asyncio.to_thread(calculate_pearson_correlation, coin_returns, btc_returns_snapshot)
             is_uncorrelated_or_decoupled = btc_correlation < 0.20
@@ -586,12 +625,11 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             )
 
             is_bullish_div = detect_bullish_divergence(hourly_closes, hist_list, period=10) if len(hourly_closes) >= 10 and max(hourly_closes[-10:]) != min(hourly_closes[-10:]) else False
-            
+
             is_bottoming, bottoming_type = detect_bottoming_pattern(
                 klines_1h=klines_1h, klines_15m=klines_15m, rsi_1h=rsi_1h, is_bullish_div=is_bullish_div
             )
 
-            # Execution eksekusi sync langsung untuk fungsi ringan
             market_struct, last_sh, last_sl = analyze_market_structure(klines_1h, 5)
 
             breakout_status = verify_breakout_status(
@@ -600,7 +638,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 local_swing_high=last_sh, z_score=vol_z_score
             )
 
-            market_liquidity_pool = m_data.get("pure_vol_24h", 0)
+            market_liquidity_pool = m_data.get("pure_vol_24h", 0) if m_data else 0
             required_vol_spike = 1.5 if market_liquidity_pool >= 50000000 else (3.5 if market_liquidity_pool <= 5000000 else 2.0)
 
             candle_range_denom = max(0.0001, high_price - low_price)
@@ -613,13 +651,14 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 base_whale -= 25.0  
             whale_dominance = round(max(10.0, min(99.0, base_whale)), 1)
 
-            btc_risk = calculate_btc_risk_level(state_manager.btc_status, btc_returns_snapshot)
+            btc_risk = calculate_btc_risk_level(getattr(state_manager, 'btc_status', {}), btc_returns_snapshot)
 
-            prediksi_tren, probabilitas_prediksi, proyeksi_atas, proyeksi_bawah = prediksi_arah_tren(
-                klines_1w=klines_1w, klines_1d=klines_1d, klines_1h=klines_1h, klines_15m=klines_15m,
-                atr_sekarang=atr, vol_spike_ratio=vol_spike_ratio, is_squeeze=is_squeeze,
-                is_confirmed_breakout=is_confirmed_breakout, is_15m_volume_burst=is_15m_volume_burst,
-                btc_correlation=btc_correlation, btc_risk_level=btc_risk["level"], pure_vol_24h=market_liquidity_pool
+            prediksi_tren, probabilitas_prediksi, proyeksi_atas, proyeksi_bawah = await asyncio.to_thread(
+                prediksi_arah_tren,
+                klines_1w, klines_1d, klines_1h, klines_15m,
+                atr, vol_spike_ratio, is_squeeze,
+                is_confirmed_breakout, is_15m_volume_burst,
+                btc_correlation, btc_risk["level"], market_liquidity_pool
             )
 
             if w1_close >= w2_close and live_price > ma25_daily:
@@ -637,7 +676,8 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
 
             fase = "CONSOLIDATION"
             if btc_risk["level"] == 4 and coin_name not in user_portfolio:
-                fase = f"ENGINE LOCKED ({state_manager.btc_status.get('reason','CRASH')})"
+                btc_reason = getattr(state_manager, 'btc_status', {}).get('reason', 'CRASH')
+                fase = f"ENGINE LOCKED ({btc_reason})"
             else:
                 if status_rencana_otomatis == "STRONG BUY":
                     fase = "INSTITUTIONAL BUY" if is_ma_trend_bullish and order_book_ratio > 1.2 else "VALID BREAKOUT"
@@ -650,7 +690,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 elif is_bullish_div and price_pct_1h > volatility_based_threshold:
                     fase = "🔄 MOMENTUM REVERSAL (BOTTOMING)"
 
-            if state_manager.is_alert_state_differs(coin_name, fase):
+            if hasattr(state_manager, 'is_alert_state_differs') and state_manager.is_alert_state_differs(coin_name, fase):
                 if status_rencana_otomatis == "STRONG BUY" or fase in ["VALID BREAKOUT", "INSTITUTIONAL BUY", "⚡ SQUEEZE BREAKOUT (EARLY TREND)"] or "BOTTOMING" in fase:
                     if btc_risk["allowed_trade"] or is_uncorrelated_or_decoupled:
                         emoji = "🛡️ BOTTOMING DETECTED!" if "BOTTOMING" in fase else ("👑 BRAND NEW MSS BREAKOUT!" if fase == "INSTITUTIONAL BUY" else "🔥 BREAKOUT SPIKE")
@@ -671,13 +711,16 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                             f"🎯 *Projected Range*: {fmt_bawah} - {fmt_atas}\n"
                             f"Live Price: *{harga_terformat}*"
                         )
-                state_manager.update_alert_state(coin_name, fase)
+                if hasattr(state_manager, 'update_alert_state'):
+                    state_manager.update_alert_state(coin_name, fase)
 
             coin_p_data = user_portfolio.get(coin_name, {})
             entry_price = float(coin_p_data.get("costPrice") or 0.0)
             amount = float(coin_p_data.get("amount") or 0.0)
 
-            current_peak = state_manager.update_trailing_peak(device_id, coin_name, entry_price, live_price) if entry_price > 0 and amount > 0 else 0.0
+            current_peak = 0.0
+            if entry_price > 0 and amount > 0 and hasattr(state_manager, 'update_trailing_peak'):
+                current_peak = state_manager.update_trailing_peak(device_id, coin_name, entry_price, live_price)
 
             dynamic_tp, dynamic_cl = hitung_matriks_atr_dinamis(
                 live_price=live_price,
@@ -706,7 +749,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
             elif status_rencana_otomatis == "STRONG BUY" and is_confirmed_breakout:
                 saran_entry = last_sh + (0.15 * smoothed_atr)
             else:
-                saran_entry = live_price - (0.5 * smoothed_atr)
+                saran_entry = max(0.0, live_price - (0.5 * smoothed_atr))
 
             if entry_price > 0:
                 if live_price >= dynamic_tp: 
@@ -717,7 +760,7 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                     await perf_logger.close_logged_signal_async(symbol, live_price)
                 else: 
                     status_rencana_otomatis = "HOLDING"
-                saran_entry = live_price - (0.75 * smoothed_atr)
+                saran_entry = max(0.0, live_price - (0.75 * smoothed_atr))
 
             pnl_val, pnl_pct, current_value = 0.0, 0.0, 0.0
             if entry_price > 0 and amount > 0:
@@ -726,13 +769,26 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 pnl_pct = (pnl_val / (amount * entry_price)) * 100
 
             return {
-                "koin": coin_name, "harga": live_price, "persen_harga": price_pct_1h,
-                "rasio": vol_spike_ratio, "fase": fase, "atr": atr, "whale": whale_dominance, "skor": momentum_score,
+                "koin": coin_name, 
+                "harga": live_price, 
+                "persen_harga": price_pct_1h,
+                "rasio": vol_spike_ratio, 
+                "fase": fase, 
+                "atr": atr, 
+                "whale": whale_dominance, 
+                "skor": momentum_score,
                 "is_portfolio": coin_name in user_portfolio,
-                "amount": amount, "entry": entry_price, "tp": dynamic_tp, "cl": dynamic_cl,
-                "status_aksi": status_rencana_otomatis, "saran_entry": saran_entry,
-                "pnl_val": pnl_val, "pnl_pct": pnl_pct, "current_value": current_value,
-                "vol_velocity_pct": f"{round(vol_velocity * 100, 1)}%", "z_score": round(vol_z_score, 2),
+                "amount": amount, 
+                "entry": entry_price, 
+                "tp": dynamic_tp, 
+                "cl": dynamic_cl,
+                "status_aksi": status_rencana_otomatis, 
+                "saran_entry": round(saran_entry, 8 if live_price < 1.0 else 4),
+                "pnl_val": pnl_val, 
+                "pnl_pct": pnl_pct, 
+                "current_value": current_value,
+                "vol_velocity_pct": f"{round(vol_velocity * 100, 1)}%", 
+                "z_score": round(vol_z_score, 2),
                 "rsi": rsi_1h,
                 "is_bottoming": is_bottoming,
                 "bottoming_type": bottoming_type,
@@ -743,5 +799,5 @@ async def process_single_coin_pipeline(client, symbol, m_data, user_portfolio, s
                 "proyeksi_bawah": round(proyeksi_bawah, 8) if live_price < 1.0 else round(proyeksi_bawah, 4)
             }
         except Exception as e:
-            print(f"[PIPELINE ERROR] Gagal memproses {symbol}: {e}")
+            logging.error(f"[PIPELINE ERROR] Gagal memproses {symbol}: {e}")
             return None

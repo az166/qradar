@@ -229,41 +229,41 @@ def get_data():
                 coin_p_data = normalized_active_portfolio[matched_key]
                 item["amount"] = float(coin_p_data.get("amount", 0.0))
                 item["entry"] = float(coin_p_data.get("costPrice", 0.0))
-                    current_peak = 0.0
-                    if item["entry"] > 0 and item["amount"] > 0 and live_price > 0:
-                        current_peak = state.update_trailing_peak(device_id, matched_key, item["entry"], live_price)
+                current_peak = 0.0
+                if item["entry"] > 0 and item["amount"] > 0 and live_price > 0:
+                    current_peak = state.update_trailing_peak(device_id, matched_key, item["entry"], live_price)
 
-                    if item["entry"] > 0 and item["amount"] > 0:
+                if item["entry"] > 0 and item["amount"] > 0:
                         # --- PENYESUAIAN KOMPOUNDING & TRAILING TP ---
                         base_compounding_price = item["entry"]
-                        if current_peak > item["entry"]:
+                if current_peak > item["entry"]:
                             base_compounding_price = current_peak
 
-                        dtp, dcl = hitung_matriks_atr_dinamis(
-                            live_price=live_price,
+                    dtp, dcl = hitung_matriks_atr_dinamis(
+                        live_price=live_price,
                             entry_price=base_compounding_price,  # Menggeser basis harga compounding
-                            atr=item.get("atr", 0.0),
-                            vol_spike_ratio=item.get("rasio", 1.0),
+                        atr=item.get("atr", 0.0),
+                          vol_spike_ratio=item.get("rasio", 1.0),
                             whale_dominance=item.get("whale", 0.0),
-                            btc_risk_level=btc_risk_level,
-                            rsi_saat_ini=rsi_val,
-                            highest_peak=current_peak,
-                            proyeksi_atas=p_atas
+                        btc_risk_level=btc_risk_level,
+                        rsi_saat_ini=rsi_val,
+                        highest_peak=current_peak,
+                        proyeksi_atas=p_atas
                         )
                         
-                        item["tp"] = dtp
-                        item["cl"] = dcl
-                        item["current_value"] = item["amount"] * live_price
-                        initial_val = item["amount"] * item["entry"]
-                        item["pnl_val"] = item["current_value"] - initial_val
-                        item["pnl_pct"] = (item["pnl_val"] / initial_val) * 100.0 if initial_val > 0 else 0.0
+                    item["tp"] = dtp
+                    item["cl"] = dcl
+                    item["current_value"] = item["amount"] * live_price
+                    initial_val = item["amount"] * item["entry"]
+                    item["pnl_val"] = item["current_value"] - initial_val
+                    item["pnl_pct"] = (item["pnl_val"] / initial_val) * 100.0 if initial_val > 0 else 0.0
 
-                        if live_price >= item["tp"]: 
+                    if live_price >= item["tp"]: 
                             item["status_aksi"] = "COMPOUNDING / TP HIT"
-                        elif live_price <= item["cl"]: 
-                            item["status_aksi"] = "CUT LOSS"
-                        else: 
-                            item["status_aksi"] = "HOLDING (RIDING TREND)"
+                    elif live_price <= item["cl"]: 
+                        item["status_aksi"] = "CUT LOSS"
+                    else: 
+                        item["status_aksi"] = "HOLDING (RIDING TREND)"
 
             else:
                 item["is_portfolio"] = False

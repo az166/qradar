@@ -132,7 +132,7 @@ async def execute_one_market_scan(target_device_id=None, minimal_bootstrap=False
                 for symbol, m_data in ticker_master_data.items()
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            
+
             temp_data = [r for r in results if r is not None and not isinstance(r, Exception)]
             temp_data.sort(key=lambda x: (x.get('is_portfolio', False), x.get('skor') or 0), reverse=True)
 
@@ -234,23 +234,23 @@ def get_data():
                     current_peak = state.update_trailing_peak(device_id, matched_key, item["entry"], live_price)
 
                 if item["entry"] > 0 and item["amount"] > 0:
-                        # --- PENYESUAIAN KOMPOUNDING & TRAILING TP ---
-                        base_compounding_price = item["entry"]
-                if current_peak > item["entry"]:
-                            base_compounding_price = current_peak
+                    # --- PENYESUAIAN KOMPOUNDING & TRAILING TP ---
+                    base_compounding_price = item["entry"]
+                    if current_peak > item["entry"]:
+                        base_compounding_price = current_peak
 
                     dtp, dcl = hitung_matriks_atr_dinamis(
                         live_price=live_price,
-                            entry_price=base_compounding_price,  # Menggeser basis harga compounding
+                        entry_price=base_compounding_price,  # Menggeser basis harga compounding
                         atr=item.get("atr", 0.0),
-                          vol_spike_ratio=item.get("rasio", 1.0),
-                            whale_dominance=item.get("whale", 0.0),
+                        vol_spike_ratio=item.get("rasio", 1.0),
+                        whale_dominance=item.get("whale", 0.0),
                         btc_risk_level=btc_risk_level,
                         rsi_saat_ini=rsi_val,
                         highest_peak=current_peak,
                         proyeksi_atas=p_atas
-                        )
-                        
+                    )
+
                     item["tp"] = dtp
                     item["cl"] = dcl
                     item["current_value"] = item["amount"] * live_price
@@ -259,7 +259,7 @@ def get_data():
                     item["pnl_pct"] = (item["pnl_val"] / initial_val) * 100.0 if initial_val > 0 else 0.0
 
                     if live_price >= item["tp"]: 
-                            item["status_aksi"] = "COMPOUNDING / TP HIT"
+                        item["status_aksi"] = "COMPOUNDING / TP HIT"
                     elif live_price <= item["cl"]: 
                         item["status_aksi"] = "CUT LOSS"
                     else: 

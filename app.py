@@ -230,7 +230,7 @@ def get_data():
                 item["amount"] = float(coin_p_data.get("amount", 0.0))
                 item["entry"] = float(coin_p_data.get("costPrice", 0.0))
 
-                                    current_peak = 0.0
+                current_peak = 0.0
                     if item["entry"] > 0 and item["amount"] > 0 and live_price > 0:
                         current_peak = state.update_trailing_peak(device_id, matched_key, item["entry"], live_price)
 

@@ -131,28 +131,29 @@
             localStorage.setItem('quantum_portfolio', JSON.stringify(portfolio));
         }
 
-        // ==================== FORMAT HARGA UNTUK KOIN MEME & REGULAR ====================
-        function formatQuantumPrice(val) {
+                // ==================== FORMAT HARGA UNTUK KOIN MEME & REGULAR ====================
+        function formatQuantumPrice(val, sigFigs = 3) {
             if (val === undefined || val === null || isNaN(val)) return "-";
             const num = parseFloat(val);
             if (num === 0) return "$0.00";
 
             if (num < 1.0) {
-                // Hitung posisi angka bukan nol pertama setelah desimal
-                const str = num.toFixed(12);
-                const decimalMatch = str.match(/^0\.(0*)/);
-                
-                let decimals = 4; // default minimum desimal
-                if (decimalMatch && decimalMatch[1]) {
-                    const zeroCount = decimalMatch[1].length;
-                    // Tampilkan angka 0 ditambah minimal 3 digit nominal non-zero (misal 6 nol + 3 digit = 9 desimal)
-                    decimals = Math.max(4, Math.min(10, zeroCount + 3));
+                // Konversi angka ke string presisi tinggi (mencegah notasi ilmiah e-7)
+                let strNum = num.toFixed(20); 
+
+                // Cari pola desimal: 0.000... diikuti digit non-nol pertama
+                const match = strNum.match(/^0\.(0*)([1-9]\d*)/);
+                if (match) {
+                    const leadingZeros = match[1]; // String deretan angka 0 setelah koma
+                    const digits = match[2];       // Sisa digit angka non-nol
+
+                    // Ambil digit non-nol sebanyak sigFigs (default 3 digit)
+                    const keptDigits = digits.substring(0, sigFigs);
+                    
+                    return `$0.${leadingZeros}${keptDigits}`;
                 }
 
-                return "$" + num.toLocaleString('en-US', { 
-                    minimumFractionDigits: 2, 
-                    maximumFractionDigits: decimals 
-                });
+                return "$" + num.toFixed(8);
             } else {
                 return "$" + num.toLocaleString('en-US', { 
                     minimumFractionDigits: 2, 
@@ -160,6 +161,7 @@
                 });
             }
         }
+
 
         function openModal(coin, amount, entry) {
             currentTargetCoin = coin;

@@ -131,23 +131,23 @@
             localStorage.setItem('quantum_portfolio', JSON.stringify(portfolio));
         }
 
-                // ==================== FORMAT HARGA UNTUK KOIN MEME & REGULAR ====================
-        function formatQuantumPrice(val, sigFigs = 3) {
+                        // ==================== FORMAT HARGA PRESISI PENUH (NON-ZERO DIGITS) ====================
+        function formatQuantumPrice(val, sigFigs = 4) {
             if (val === undefined || val === null || isNaN(val)) return "-";
             const num = parseFloat(val);
             if (num === 0) return "$0.00";
 
             if (num < 1.0) {
-                // Konversi angka ke string presisi tinggi (mencegah notasi ilmiah e-7)
-                let strNum = num.toFixed(20); 
-
-                // Cari pola desimal: 0.000... diikuti digit non-nol pertama
+                // Ubah angka menjadi string presisi tinggi (hingga 20 desimal untuk hindari scientific notation e-7)
+                const strNum = num.toFixed(20);
+                
+                // Cari pola 0. diikuti deretan angka nol dan digit penting pertama
                 const match = strNum.match(/^0\.(0*)([1-9]\d*)/);
                 if (match) {
-                    const leadingZeros = match[1]; // String deretan angka 0 setelah koma
-                    const digits = match[2];       // Sisa digit angka non-nol
+                    const leadingZeros = match[1]; // Kumpulan angka '0' setelah koma
+                    const digits = match[2];       // Sisa digit penting di belakangnya
 
-                    // Ambil digit non-nol sebanyak sigFigs (default 3 digit)
+                    // Ambil sejumlah digit signifikan yang diinginkan (default 4 digit agar presisi seperti 0.00000501)
                     const keptDigits = digits.substring(0, sigFigs);
                     
                     return `$0.${leadingZeros}${keptDigits}`;
@@ -161,7 +161,6 @@
                 });
             }
         }
-
 
         function openModal(coin, amount, entry) {
             currentTargetCoin = coin;

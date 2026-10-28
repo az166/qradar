@@ -250,9 +250,11 @@ def get_data():
                         highest_peak=current_peak,
                         proyeksi_atas=p_atas
                     )
+                    item["tp"] = float(dtp) if dtp is not None else 0.0
+                    item["cl"] = float(dcl) if dcl is not None else 0.0
 
-                    item["tp"] = dtp
-                    item["cl"] = dcl
+                  #  item["tp"] = dtp
+                 #   item["cl"] = dcl
                     item["current_value"] = item["amount"] * live_price
                     initial_val = item["amount"] * item["entry"]
                     item["pnl_val"] = item["current_value"] - initial_val
@@ -281,8 +283,10 @@ def get_data():
                     highest_peak=0.0,
                     proyeksi_atas=p_atas
                 )
-                item["tp"] = dtp
-                item["cl"] = dcl
+                item["tp"] = float(dtp) if dtp is not None else 0.0
+                item["cl"] = float(dcl) if dcl is not None else 0.0
+               # item["tp"] = dtp
+               # item["cl"] = dcl
                 item["pnl_val"] = 0.0
                 item["pnl_pct"] = 0.0
                 item["current_value"] = 0.0

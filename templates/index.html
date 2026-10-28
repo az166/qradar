@@ -130,30 +130,25 @@
         function saveLocalPortfolio(portfolio) {
             localStorage.setItem('quantum_portfolio', JSON.stringify(portfolio));
         }
-
-                        // ==================== FORMAT HARGA PRESISI PENUH (NON-ZERO DIGITS) ====================
-        function formatQuantumPrice(val, sigFigs = 4) {
+    
+        // ==================== FORMAT HARGA PRESISI ATR DINAMIS ====================
+        function formatQuantumPrice(val) {
             if (val === undefined || val === null || isNaN(val)) return "-";
             const num = parseFloat(val);
             if (num === 0) return "$0.00";
 
             if (num < 1.0) {
-                // Ubah angka menjadi string presisi tinggi (hingga 20 desimal untuk hindari scientific notation e-7)
-                const strNum = num.toFixed(20);
+                // Mengubah angka menjadi string desimal penuh tanpa batasan kaku
+                const str = num.toFixed(12);
                 
-                // Cari pola 0. diikuti deretan angka nol dan digit penting pertama
-                const match = strNum.match(/^0\.(0*)([1-9]\d*)/);
-                if (match) {
-                    const leadingZeros = match[1]; // Kumpulan angka '0' setelah koma
-                    const digits = match[2];       // Sisa digit penting di belakangnya
-
-                    // Ambil sejumlah digit signifikan yang diinginkan (default 4 digit agar presisi seperti 0.00000501)
-                    const keptDigits = digits.substring(0, sigFigs);
-                    
-                    return `$0.${leadingZeros}${keptDigits}`;
+                // Menghapus angka nol di ujung belakang (trailing zeros) yang tidak perlu, 
+                // tapi menyisakan minimal 2 digit terakhir agar tetap presisi
+                let trimmed = str.replace(/0+$/, '');
+                if (trimmed.endsWith('.')) {
+                    trimmed += '00';
                 }
-
-                return "$" + num.toFixed(8);
+                
+                return "$" + trimmed;
             } else {
                 return "$" + num.toLocaleString('en-US', { 
                     minimumFractionDigits: 2, 
